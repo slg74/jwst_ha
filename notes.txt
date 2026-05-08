@@ -1,0 +1,115 @@
+JWST Daily Image — Local HA Kubernetes Setup
+=============================================
+
+What we built
+-------------
+A local stacked HA Kubernetes cluster (3 control planes + 2 workers) using kind,
+with NGINX ingress routing traffic to a Python web app that fetches the daily
+James Webb Space Telescope image from the NASA image library and displays it
+at http://localhost. The app runs as a 3-replica Deployment and shows which pod
+is serving each request.
+
+
+Cluster setup
+-------------
+
+# Create the HA cluster with port mappings for ingress on the first control plane
+kind create cluster --name ha-cluster --config 03-installation-and-setup/kind-ha-config.yaml
+
+# kind-ha-config.yaml: 3 control planes, 2 workers.
+# First control plane has extraPortMappings (80/443 -> host) and ingress-ready=true label.
+
+# Deploy the NGINX ingress controller
+kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/kind/deploy.yaml --context kind-ha-cluster
+
+# Patch ingress controller to schedule on the node with the port mappings
+kubectl patch deployment ingress-nginx-controller -n ingress-nginx --context kind-ha-cluster \
+  --type=json \
+  -p='[{"op":"add","path":"/spec/template/spec/nodeSelector/ingress-ready","value":"true"}]'
+
+
+App deployment
+--------------
+
+# Deploy everything (ConfigMap with Python server + HTML, Deployment, Service, Ingress)
+kubectl apply -f 03-installation-and-setup/jwst-app.yaml --context kind-ha-cluster
+
+# The app is served by python:3.11-alpine using only the stdlib http.server module.
+# No custom Docker image needed — the code lives in a ConfigMap mounted at /app.
+# Pod name is injected via the Downward API as POD_NAME env var.
+# The browser fetches JWST images directly from the NASA image library API (CORS-enabled).
+
+
+Verify
+------
+
+curl http://localhost
+kubectl get pods -o wide --context kind-ha-cluster
+kubectl get nodes --context kind-ha-cluster
+
+
+HA test
+-------
+
+# Kill a control plane node
+docker stop ha-cluster-control-plane2
+
+# Verify API server still responds (HAProxy routes to remaining 2)
+kubectl get nodes --context kind-ha-cluster
+
+# Verify app still serves
+curl http://localhost
+
+# Check etcd liveness (member list STATUS column is not liveness — use endpoint health)
+kubectl exec -n kube-system etcd-ha-cluster-control-plane -- etcdctl \
+  --endpoints=https://172.18.0.8:2379,https://172.18.0.9:2379,https://172.18.0.10:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key \
+  endpoint health
+
+# Bring the node back
+docker start ha-cluster-control-plane2
+kubectl get nodes --context kind-ha-cluster --watch
+
+
+Useful commands
+---------------
+
+# All pod IPs
+kubectl get pods -A -o jsonpath='{range .items[*]}{.status.podIP}{"\n"}{end}' --context kind-ha-cluster
+
+# etcd member list
+kubectl exec -n kube-system etcd-ha-cluster-control-plane -- etcdctl \
+  --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key \
+  member list
+
+# All etcd keys
+kubectl exec -n kube-system etcd-ha-cluster-control-plane -- etcdctl \
+  --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key \
+  get / --prefix --keys-only
+
+
+Key concepts covered
+--------------------
+- Stacked HA control plane: etcd co-located on control plane nodes (vs. external etcd topology)
+- HAProxy load balancer: kind automatically provisions one in front of the 3 API servers
+- etcd quorum: 3 members tolerate 1 failure (majority = 2/3)
+- etcd member list STATUS ("started"/"unstarted") is NOT liveness — use endpoint health
+- Pod IPs are ephemeral; always use Service ClusterIPs for stable addressing
+- extraPortMappings: required in kind config at creation time for host -> container port binding
+- Ingress vs port-forward: ingress is stable; kubectl port-forward is a debug tunnel that drops
+- Downward API: injects pod metadata (name, namespace, etc.) as env vars into containers
+- ConfigMap as code mount: avoids building custom Docker images for simple apps
+
+
+Files
+-----
+03-installation-and-setup/kind-ha-config.yaml   — kind cluster config
+03-installation-and-setup/jwst-app.yaml         — ConfigMap, Deployment, Service, Ingress
