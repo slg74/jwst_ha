@@ -1,0 +1,422 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: galaga-server
+  namespace: default
+data:
+  server.py: |
+    #!/usr/bin/env python3
+    import http.server, os, socket, pathlib
+
+    HTML = pathlib.Path('/app/index.html').read_bytes()
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == '/hostname':
+                name = os.environ.get('POD_NAME', socket.gethostname()).encode()
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/plain')
+                self.end_headers()
+                self.wfile.write(name)
+            else:
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/html; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(HTML)
+
+        def log_message(self, fmt, *args):
+            pass
+
+    http.server.HTTPServer(('', 8080), Handler).serve_forever()
+
+  index.html: |
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+      <meta charset="UTF-8">
+      <title>Galaga</title>
+      <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { background: #000; display: flex; justify-content: center; align-items: center; height: 100vh; overflow: hidden; }
+        canvas { display: block; }
+      </style>
+    </head>
+    <body>
+    <canvas id="c"></canvas>
+    <script>
+    const C = document.getElementById('c');
+    const ctx = C.getContext('2d');
+    const W = 480, H = 640;
+    C.width = W; C.height = H;
+
+    function resize() {
+      const sc = Math.min(window.innerWidth / W, window.innerHeight / H);
+      C.style.width = (W * sc) + 'px';
+      C.style.height = (H * sc) + 'px';
+    }
+    window.addEventListener('resize', resize);
+    resize();
+
+    // --- Audio ---
+    let aud;
+    function initAud() { if (!aud) aud = new AudioContext(); if (aud.state === 'suspended') aud.resume(); }
+    function beep(freq, dur, type = 'square', vol = 0.18) {
+      if (!aud) return;
+      try {
+        const o = aud.createOscillator(), g = aud.createGain();
+        o.connect(g); g.connect(aud.destination);
+        o.type = type; o.frequency.value = freq;
+        g.gain.setValueAtTime(vol, aud.currentTime);
+        g.gain.exponentialRampToValueAtTime(0.001, aud.currentTime + dur);
+        o.start(); o.stop(aud.currentTime + dur);
+      } catch(e) {}
+    }
+
+    // --- Input ---
+    const keys = {};
+    document.addEventListener('keydown', e => {
+      initAud(); keys[e.code] = true;
+      if (['Space','ArrowLeft','ArrowRight','ArrowUp','ArrowDown'].includes(e.code)) e.preventDefault();
+    });
+    document.addEventListener('keyup', e => { keys[e.code] = false; });
+
+    // --- Stars ---
+    const stars = Array.from({length: 90}, () => ({
+      x: Math.random() * W, y: Math.random() * H,
+      s: Math.random() * 1.2 + 0.4, v: Math.random() * 0.5 + 0.15
+    }));
+
+    // --- Constants ---
+    const COLS = 8, ROWS = 4;
+    const GAP_X = 50, GAP_Y = 46;
+    const FORM_X = (W - (COLS - 1) * GAP_X) / 2;
+    const FORM_Y = 88;
+    const TYPES = ['boss', 'butterfly', 'bee', 'bee'];
+    const PW = 26, PH = 26;
+
+    // --- State ---
+    let score, hiscore = 0, stage, gameState;
+    let player, enemies, formOff, formDir, diveTimer, eBullets, shootTimer;
+
+    function initWave() {
+      enemies = [];
+      for (let r = 0; r < ROWS; r++)
+        for (let c = 0; c < COLS; c++)
+          enemies.push({ col: c, row: r, type: TYPES[r], alive: true,
+            diving: false, x: 0, y: 0, dvx: 0, dvy: 0, phase: 0 });
+      formOff = 0; formDir = 1;
+      diveTimer = 150; shootTimer = 100; eBullets = [];
+    }
+
+    function startGame() {
+      score = 0; stage = 1;
+      player = { x: W / 2, y: H - 56, lives: 3, inv: 0, shootCd: 0, bullets: [] };
+      initWave();
+      gameState = 'play';
+    }
+
+    function respawn() {
+      player.x = W / 2; player.inv = 200;
+      player.bullets = []; player.shootCd = 0;
+      eBullets = []; gameState = 'play';
+    }
+
+    function killPlayer() {
+      beep(100, 0.6, 'sawtooth', 0.35);
+      player.lives--;
+      if (player.lives <= 0) { gameState = 'gameover'; }
+      else { gameState = 'dead'; setTimeout(respawn, 1800); }
+    }
+
+    // --- Draw ---
+    function drawShip(x, y, a) {
+      ctx.save(); ctx.globalAlpha = a !== undefined ? a : 1;
+      ctx.fillStyle = '#00ddbb';
+      ctx.beginPath(); ctx.moveTo(x, y - 13); ctx.lineTo(x - 9, y + 10); ctx.lineTo(x + 9, y + 10); ctx.closePath(); ctx.fill();
+      ctx.fillStyle = '#007a6e';
+      ctx.beginPath(); ctx.moveTo(x - 9, y + 2); ctx.lineTo(x - 22, y + 14); ctx.lineTo(x - 5, y + 10); ctx.closePath(); ctx.fill();
+      ctx.beginPath(); ctx.moveTo(x + 9, y + 2); ctx.lineTo(x + 22, y + 14); ctx.lineTo(x + 5, y + 10); ctx.closePath(); ctx.fill();
+      ctx.fillStyle = '#aaffee'; ctx.beginPath(); ctx.ellipse(x, y - 2, 3, 5, 0, 0, Math.PI * 2); ctx.fill();
+      ctx.restore();
+    }
+
+    function drawEnemy(e) {
+      if (!e.alive) return;
+      ctx.save(); ctx.translate(e.x, e.y);
+      if (e.type === 'boss') {
+        ctx.fillStyle = '#ff2255';
+        ctx.beginPath(); ctx.moveTo(0,-17); ctx.lineTo(15,0); ctx.lineTo(0,17); ctx.lineTo(-15,0); ctx.closePath(); ctx.fill();
+        ctx.fillStyle = '#ffdd00';
+        ctx.beginPath(); ctx.moveTo(0,-9); ctx.lineTo(8,0); ctx.lineTo(0,9); ctx.lineTo(-8,0); ctx.closePath(); ctx.fill();
+        ctx.fillStyle = '#ffaacc'; ctx.beginPath(); ctx.arc(0, 0, 3, 0, Math.PI * 2); ctx.fill();
+      } else if (e.type === 'butterfly') {
+        ctx.fillStyle = '#1155ee';
+        ctx.beginPath(); ctx.ellipse(-9,-5,10,6,-0.4,0,Math.PI*2); ctx.fill();
+        ctx.beginPath(); ctx.ellipse(9,-5,10,6,0.4,0,Math.PI*2); ctx.fill();
+        ctx.beginPath(); ctx.ellipse(-7,6,7,5,0.3,0,Math.PI*2); ctx.fill();
+        ctx.beginPath(); ctx.ellipse(7,6,7,5,-0.3,0,Math.PI*2); ctx.fill();
+        ctx.fillStyle = '#88aaff'; ctx.beginPath(); ctx.ellipse(0, 0, 3, 9, 0, 0, Math.PI * 2); ctx.fill();
+      } else {
+        ctx.fillStyle = '#ffcc00';
+        ctx.beginPath(); ctx.ellipse(0, 1, 8, 10, 0, 0, Math.PI * 2); ctx.fill();
+        ctx.fillStyle = '#000';
+        ctx.fillRect(-9, -4, 18, 3); ctx.fillRect(-9, 3, 18, 3);
+        ctx.fillStyle = 'rgba(180,230,255,0.7)';
+        ctx.beginPath(); ctx.ellipse(-12,-2,7,4,-0.3,0,Math.PI*2); ctx.fill();
+        ctx.beginPath(); ctx.ellipse(12,-2,7,4,0.3,0,Math.PI*2); ctx.fill();
+      }
+      ctx.restore();
+    }
+
+    function drawBullet(x, y, c, gc) {
+      ctx.fillStyle = gc; ctx.fillRect(x - 4, y - 10, 8, 20);
+      ctx.fillStyle = c;  ctx.fillRect(x - 2, y - 8,  4, 16);
+    }
+
+    function drawHUD() {
+      ctx.fillStyle = '#fff'; ctx.font = '14px monospace';
+      ctx.textAlign = 'left';   ctx.fillText('SCORE  ' + String(score).padStart(6,'0'), 8, 22);
+      ctx.textAlign = 'right';  ctx.fillText('HI  ' + String(hiscore).padStart(6,'0'), W - 8, 22);
+      ctx.textAlign = 'center'; ctx.fillText('STAGE ' + stage, W / 2, 22);
+      ctx.textAlign = 'left';
+      for (let i = 0; i < player.lives - 1; i++) drawShip(22 + i * 28, H - 16, 0.75);
+    }
+
+    function aabb(ax, ay, aw, ah, bx, by, bw, bh) {
+      return Math.abs(ax - bx) < (aw + bw) / 2 && Math.abs(ay - by) < (ah + bh) / 2;
+    }
+
+    // --- Main loop ---
+    gameState = 'attract';
+    let last = 0;
+
+    function frame(ts) {
+      requestAnimationFrame(frame);
+      const dt = Math.min(ts - last, 50); last = ts;
+
+      ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
+
+      stars.forEach(s => {
+        s.y += s.v; if (s.y > H) { s.y = 0; s.x = Math.random() * W; }
+        ctx.fillStyle = 'rgba(255,255,255,' + (0.25 + s.s * 0.4) + ')';
+        ctx.fillRect(s.x, s.y, s.s, s.s);
+      });
+
+      // Attract screen
+      if (gameState === 'attract') {
+        ctx.textAlign = 'center';
+        ctx.fillStyle = '#ffcc00'; ctx.font = 'bold 52px monospace'; ctx.fillText('GALAGA', W/2, H/2 - 70);
+        ctx.fillStyle = '#fff';    ctx.font = '16px monospace';       ctx.fillText('PRESS SPACE TO START', W/2, H/2 - 10);
+        ctx.fillStyle = '#556';    ctx.font = '12px monospace';
+        ctx.fillText('ARROWS / WASD  —  MOVE', W/2, H/2 + 30);
+        ctx.fillText('SPACE / Z  —  FIRE', W/2, H/2 + 50);
+        ctx.textAlign = 'left';
+        if (keys['Space'] || keys['KeyZ']) startGame();
+        return;
+      }
+
+      const playing = gameState === 'play';
+
+      // Formation bounds check and move
+      const fEnemies = enemies.filter(e => e.alive && !e.diving);
+      if (fEnemies.length) {
+        const xs = fEnemies.map(e => FORM_X + e.col * GAP_X + formOff);
+        if (Math.max(...xs) > W - 24) formDir = -1;
+        if (Math.min(...xs) < 24)     formDir =  1;
+        formOff += formDir * 0.85;
+      }
+
+      // Update enemy positions
+      enemies.forEach(e => {
+        if (!e.alive) return;
+        if (!e.diving) {
+          e.x = FORM_X + e.col * GAP_X + formOff;
+          e.y = FORM_Y + e.row * GAP_Y;
+        } else {
+          e.phase += 0.05;
+          e.x += e.dvx + Math.sin(e.phase) * 1.6;
+          e.y += e.dvy;
+          if (e.y > H + 50) e.alive = false;
+        }
+      });
+
+      if (playing) {
+        // Trigger a dive
+        diveTimer--;
+        if (diveTimer <= 0) {
+          const cands = enemies.filter(e => e.alive && !e.diving);
+          const diving = enemies.filter(e => e.alive && e.diving);
+          if (cands.length && diving.length < 3) {
+            const e = cands[Math.floor(Math.random() * cands.length)];
+            const dx = player.x - e.x, dy = player.y - e.y;
+            const len = Math.hypot(dx, dy) || 1;
+            e.diving = true; e.phase = 0;
+            e.dvx = dx / len * 2.4; e.dvy = dy / len * 3.6 + 0.4;
+            beep(330, 0.06, 'square', 0.08);
+          }
+          diveTimer = 65 + Math.random() * 100;
+        }
+
+        // Enemy shoot
+        shootTimer--;
+        if (shootTimer <= 0 && eBullets.length < 5) {
+          const shooters = enemies.filter(e => e.alive);
+          if (shooters.length) {
+            const e = shooters[Math.floor(Math.random() * shooters.length)];
+            eBullets.push({ x: e.x, y: e.y + 14 });
+          }
+          shootTimer = 48 + Math.random() * 55;
+        }
+
+        // Player move
+        if ((keys['ArrowLeft']  || keys['KeyA']) && player.x > 20)    player.x -= 4;
+        if ((keys['ArrowRight'] || keys['KeyD']) && player.x < W - 20) player.x += 4;
+
+        // Player fire
+        player.shootCd--;
+        if ((keys['Space'] || keys['KeyZ']) && player.shootCd <= 0 && player.bullets.length < 2) {
+          player.bullets.push({ x: player.x, y: player.y - 14 });
+          player.shootCd = 18;
+          beep(900, 0.07, 'square', 0.12);
+        }
+
+        if (player.inv > 0) player.inv--;
+      }
+
+      // Move bullets
+      player.bullets.forEach(b => b.y -= 10);
+      eBullets.forEach(b => b.y += 3.8);
+      player.bullets = player.bullets.filter(b => b.y > -10);
+      eBullets = eBullets.filter(b => b.y < H + 10);
+
+      // Player bullet vs enemy
+      player.bullets = player.bullets.filter(b => {
+        for (const e of enemies) {
+          if (!e.alive) continue;
+          const sz = e.type === 'boss' ? 24 : 20;
+          if (aabb(b.x, b.y, 4, 16, e.x, e.y, sz, sz)) {
+            e.alive = false;
+            const pts = e.type === 'boss'      ? (e.diving ? 1600 : 400)
+                      : e.type === 'butterfly' ? (e.diving ?  800 : 200)
+                                               : (e.diving ?  400 : 100);
+            score += pts; hiscore = Math.max(hiscore, score);
+            beep(e.type === 'boss' ? 330 : 220, 0.14, 'sawtooth', 0.22);
+            return false;
+          }
+        }
+        return true;
+      });
+
+      // Enemy bullet vs player
+      if (playing && player.inv <= 0) {
+        for (let i = eBullets.length - 1; i >= 0; i--) {
+          const b = eBullets[i];
+          if (aabb(b.x, b.y, 4, 16, player.x, player.y, PW, PH)) {
+            eBullets.splice(i, 1); killPlayer(); break;
+          }
+        }
+        // Diving enemy vs player
+        for (const e of enemies) {
+          if (e.alive && e.diving && aabb(e.x, e.y, 18, 18, player.x, player.y, PW, PH)) {
+            e.alive = false; killPlayer(); break;
+          }
+        }
+      }
+
+      // Wave clear
+      if (playing && enemies.every(e => !e.alive)) {
+        stage++; initWave();
+        beep(660, 0.08); setTimeout(() => beep(880, 0.08), 130); setTimeout(() => beep(1100, 0.18), 260);
+      }
+
+      // --- Render ---
+      enemies.forEach(drawEnemy);
+      player.bullets.forEach(b => drawBullet(b.x, b.y, '#00ffcc', 'rgba(0,255,200,0.25)'));
+      eBullets.forEach(b =>       drawBullet(b.x, b.y, '#ff4444', 'rgba(255,60,60,0.25)'));
+
+      if (playing) {
+        const blink = player.inv > 0 && Math.floor(player.inv / 5) % 2;
+        if (!blink) drawShip(player.x, player.y);
+      }
+
+      if (player) drawHUD();
+
+      // Game over overlay
+      if (gameState === 'gameover') {
+        ctx.fillStyle = 'rgba(0,0,0,0.65)'; ctx.fillRect(0, 0, W, H);
+        ctx.textAlign = 'center';
+        ctx.fillStyle = '#ff3344'; ctx.font = 'bold 44px monospace'; ctx.fillText('GAME OVER', W/2, H/2 - 24);
+        ctx.fillStyle = '#888';    ctx.font = '15px monospace';       ctx.fillText('SPACE to play again', W/2, H/2 + 22);
+        ctx.textAlign = 'left';
+        if (keys['Space'] || keys['KeyZ']) startGame();
+      }
+    }
+
+    requestAnimationFrame(frame);
+    </script>
+    </body>
+    </html>
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: galaga-app
+  namespace: default
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: galaga-app
+  template:
+    metadata:
+      labels:
+        app: galaga-app
+    spec:
+      containers:
+        - name: server
+          image: python:3.11-alpine
+          command: ["python3", "/app/server.py"]
+          ports:
+            - containerPort: 8080
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          volumeMounts:
+            - name: app
+              mountPath: /app
+      volumes:
+        - name: app
+          configMap:
+            name: galaga-server
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: galaga-app
+  namespace: default
+spec:
+  selector:
+    app: galaga-app
+  ports:
+    - port: 80
+      targetPort: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: galaga-app
+  namespace: default
+spec:
+  ingressClassName: nginx
+  rules:
+    - http:
+        paths:
+          - path: /galaga
+            pathType: Prefix
+            backend:
+              service:
+                name: galaga-app
+                port:
+                  number: 80
