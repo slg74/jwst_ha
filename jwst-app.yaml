@@ -1,0 +1,230 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: jwst-server
+  namespace: default
+data:
+  server.py: |
+    #!/usr/bin/env python3
+    import http.server, os, socket, pathlib
+
+    HTML = pathlib.Path('/app/index.html').read_bytes()
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == '/hostname':
+                name = os.environ.get('POD_NAME', socket.gethostname()).encode()
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/plain')
+                self.end_headers()
+                self.wfile.write(name)
+            elif self.path in ('/', '/index.html'):
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/html; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(HTML)
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+        def log_message(self, fmt, *args):
+            pass
+
+    http.server.HTTPServer(('', 8080), Handler).serve_forever()
+
+  index.html: |
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+      <meta charset="UTF-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <title>JWST Daily Image</title>
+      <style>
+        *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+          background: #080810;
+          color: #c8d8f0;
+          font-family: system-ui, -apple-system, sans-serif;
+          min-height: 100vh;
+          display: flex;
+          flex-direction: column;
+          align-items: center;
+          padding: 2rem 1rem;
+        }
+        header { text-align: center; margin-bottom: 2rem; }
+        .label {
+          font-size: 0.7rem;
+          letter-spacing: 0.35em;
+          text-transform: uppercase;
+          color: #3d5a8a;
+          margin-bottom: 0.4rem;
+        }
+        h1 { font-size: 1.5rem; font-weight: 300; color: #99b8f0; letter-spacing: 0.06em; }
+        .date { margin-top: 0.4rem; font-size: 0.78rem; color: #2d3e5a; letter-spacing: 0.08em; }
+        .card { max-width: 880px; width: 100%; }
+        #object-name {
+          font-size: 1.2rem;
+          color: #d8ecff;
+          margin-bottom: 0.9rem;
+          font-weight: 400;
+          line-height: 1.4;
+          min-height: 1.8rem;
+        }
+        #image-wrap {
+          width: 100%;
+          background: #0c0c18;
+          border: 1px solid #18284a;
+          border-radius: 6px;
+          overflow: hidden;
+          min-height: 320px;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+        }
+        #jwst-image { width: 100%; height: auto; display: block; }
+        .status { color: #2d3e5a; font-size: 0.85rem; padding: 4rem; text-align: center; }
+        #description {
+          margin-top: 1.2rem;
+          font-size: 0.86rem;
+          line-height: 1.8;
+          color: #6a84a8;
+          max-height: 7.5rem;
+          overflow: hidden;
+          position: relative;
+        }
+        #description::after {
+          content: '';
+          position: absolute;
+          bottom: 0; left: 0; right: 0;
+          height: 2.5rem;
+          background: linear-gradient(transparent, #080810);
+        }
+        footer {
+          margin-top: 2rem;
+          font-size: 0.68rem;
+          color: #1a2a3a;
+          text-align: center;
+          width: 100%;
+          max-width: 880px;
+          border-top: 1px solid #0d1820;
+          padding-top: 0.9rem;
+        }
+        .error { color: #c04433; }
+      </style>
+    </head>
+    <body>
+      <header>
+        <div class="label">NASA / ESA / CSA</div>
+        <h1>James Webb Space Telescope</h1>
+        <div class="date" id="date"></div>
+      </header>
+      <div class="card">
+        <div id="object-name"></div>
+        <div id="image-wrap">
+          <div class="status" id="status">Fetching from the cosmos...</div>
+          <img id="jwst-image" style="display:none" alt="JWST observation" />
+        </div>
+        <div id="description"></div>
+      </div>
+      <footer id="footer"></footer>
+      <script>
+        document.getElementById('date').textContent = new Date().toLocaleDateString('en-US', {
+          weekday: 'long', year: 'numeric', month: 'long', day: 'numeric'
+        });
+
+        async function load() {
+          const status = document.getElementById('status');
+          try {
+            const res = await fetch('https://images-api.nasa.gov/search?q=james+webb+space+telescope&media_type=image&page_size=100');
+            if (!res.ok) throw new Error('HTTP ' + res.status);
+            const data = await res.json();
+            const items = data.collection.items.filter(i => i.links && i.links.length);
+            if (!items.length) throw new Error('No images returned');
+            const item = items[Math.floor(Date.now() / 86400000) % items.length];
+            const title = item.data[0].title;
+            const desc = (item.data[0].description || '').replace(/\s+/g, ' ').trim();
+            const thumb = item.links[0].href;
+            const large = thumb.replace('~thumb.jpg', '~large.jpg');
+            document.getElementById('object-name').textContent = title;
+            document.getElementById('description').textContent = desc;
+            const img = document.getElementById('jwst-image');
+            img.onload = () => { status.style.display = 'none'; img.style.display = 'block'; };
+            img.onerror = () => { img.src = thumb; };
+            img.src = large;
+          } catch (e) {
+            status.innerHTML = '<span class="error">Could not load image: ' + e.message + '</span>';
+          }
+        }
+
+        fetch('/hostname').then(r => r.text()).then(h => {
+          document.getElementById('footer').textContent = 'served by pod ' + h.trim();
+        }).catch(() => {});
+
+        load();
+      </script>
+    </body>
+    </html>
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jwst-app
+  namespace: default
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: jwst-app
+  template:
+    metadata:
+      labels:
+        app: jwst-app
+    spec:
+      containers:
+        - name: server
+          image: python:3.11-alpine
+          command: ["python3", "/app/server.py"]
+          ports:
+            - containerPort: 8080
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          volumeMounts:
+            - name: app
+              mountPath: /app
+      volumes:
+        - name: app
+          configMap:
+            name: jwst-server
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: jwst-app
+  namespace: default
+spec:
+  selector:
+    app: jwst-app
+  ports:
+    - port: 80
+      targetPort: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: jwst-app
+  namespace: default
+spec:
+  ingressClassName: nginx
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: jwst-app
+                port:
+                  number: 80
