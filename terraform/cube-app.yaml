@@ -1,0 +1,201 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cube-server
+  namespace: default
+data:
+  server.py: |
+    #!/usr/bin/env python3
+    import http.server, os, socket, pathlib
+
+    HTML = pathlib.Path('/app/index.html').read_bytes()
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == '/hostname':
+                name = os.environ.get('POD_NAME', socket.gethostname()).encode()
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/plain')
+                self.end_headers()
+                self.wfile.write(name)
+            else:
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/html; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(HTML)
+
+        def log_message(self, fmt, *args):
+            pass
+
+    http.server.HTTPServer(('', 8080), Handler).serve_forever()
+
+  index.html: |
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+      <meta charset="UTF-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <title>Isometric Cube</title>
+      <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { background: #0a0a12; overflow: hidden; }
+        canvas { display: block; }
+        .hint {
+          position: fixed;
+          bottom: 1.5rem;
+          left: 50%;
+          transform: translateX(-50%);
+          font: 0.75rem/1 system-ui, sans-serif;
+          color: #1e2e44;
+          letter-spacing: 0.12em;
+          pointer-events: none;
+          text-transform: uppercase;
+        }
+      </style>
+    </head>
+    <body>
+      <div class="hint">click and drag to rotate</div>
+      <script type="importmap">
+      {
+        "imports": {
+          "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+          "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+        }
+      }
+      </script>
+      <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+        const scene = new THREE.Scene();
+
+        const aspect = window.innerWidth / window.innerHeight;
+        const frustum = 3;
+        const camera = new THREE.OrthographicCamera(
+          -frustum * aspect, frustum * aspect,
+          frustum, -frustum,
+          0.1, 100
+        );
+        camera.position.set(4, 4, 4);
+        camera.lookAt(0, 0, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        renderer.setClearColor(0x0a0a12);
+        document.body.appendChild(renderer.domElement);
+
+        const ambient = new THREE.AmbientLight(0xffffff, 0.4);
+        scene.add(ambient);
+
+        const key = new THREE.DirectionalLight(0xffffff, 1.2);
+        key.position.set(5, 8, 5);
+        scene.add(key);
+
+        const fill = new THREE.DirectionalLight(0x4466ff, 0.35);
+        fill.position.set(-5, -3, -5);
+        scene.add(fill);
+
+        const faceColors = [0x4488ff, 0x3366dd, 0x22aaff, 0x1188ee, 0x66aaff, 0x2255cc];
+        const materials = faceColors.map(c =>
+          new THREE.MeshPhongMaterial({ color: c, shininess: 80 })
+        );
+
+        const geometry = new THREE.BoxGeometry(2, 2, 2);
+        const cube = new THREE.Mesh(geometry, materials);
+        scene.add(cube);
+
+        const edges = new THREE.EdgesGeometry(geometry);
+        const wireframe = new THREE.LineSegments(
+          edges,
+          new THREE.LineBasicMaterial({ color: 0x99ccff })
+        );
+        cube.add(wireframe);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enablePan = false;
+        controls.enableZoom = false;
+        controls.rotateSpeed = 0.65;
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.08;
+
+        window.addEventListener('resize', () => {
+          const aspect = window.innerWidth / window.innerHeight;
+          camera.left   = -frustum * aspect;
+          camera.right  =  frustum * aspect;
+          camera.updateProjectionMatrix();
+          renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        (function animate() {
+          requestAnimationFrame(animate);
+          controls.update();
+          renderer.render(scene, camera);
+        })();
+      </script>
+    </body>
+    </html>
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cube-app
+  namespace: default
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cube-app
+  template:
+    metadata:
+      labels:
+        app: cube-app
+    spec:
+      containers:
+        - name: server
+          image: python:3.11-alpine
+          command: ["python3", "/app/server.py"]
+          ports:
+            - containerPort: 8080
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          volumeMounts:
+            - name: app
+              mountPath: /app
+      volumes:
+        - name: app
+          configMap:
+            name: cube-server
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cube-app
+  namespace: default
+spec:
+  selector:
+    app: cube-app
+  ports:
+    - port: 80
+      targetPort: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: cube-app
+  namespace: default
+spec:
+  ingressClassName: nginx
+  rules:
+    - http:
+        paths:
+          - path: /cube
+            pathType: Prefix
+            backend:
+              service:
+                name: cube-app
+                port:
+                  number: 80
